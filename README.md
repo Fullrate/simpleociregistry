@@ -55,5 +55,5 @@ will be purged entirely. The cache is also rescanned every 10 minutes.
 Disclaimer
 ----------
 
-This registry is in production use at Fullrate. This registry is _not_ designed
-to be a super-scalable general-purpose solution.
+This registry is in use at Fullrate. This registry is _not_ designed to be
+a super-scalable general-purpose solution.
