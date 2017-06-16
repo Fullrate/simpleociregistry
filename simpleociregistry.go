@@ -446,13 +446,15 @@ func (reg *OCIRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "blobs":
 		log.WithFields(log.Fields{
-			"name": name,
-			"blob": reference,
+			"name":   name,
+			"method": r.Method,
+			"blob":   reference,
 		}).Debug("Blob request")
 		reg.HandleBlobs(name, reference, w, r)
 	case "manifests":
 		log.WithFields(log.Fields{
 			"name":      name,
+			"method":    r.Method,
 			"reference": reference,
 		}).Debug("Manifest request")
 		reg.HandleManifests(name, reference, w, r)
