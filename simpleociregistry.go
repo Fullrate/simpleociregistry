@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	ociImage "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type OCISummary struct {
@@ -175,16 +177,6 @@ func (reg *OCIRegistry) WalkTGZ(f *os.File, cb WalkCB) error {
 	}
 }
 
-type OCIBlobRef struct {
-	MediaType string `json:"mediaType"`
-	Size      int64  `json:"size"`
-	Digest    string `json:"digest"`
-}
-
-type OCILayoutVersion struct {
-	ImageLayoutVersion string `json:"imageLayoutVersion"`
-}
-
 func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -204,7 +196,7 @@ func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 		ModTime: fi.ModTime(),
 	}
 
-	var layout OCILayoutVersion
+	var layout *ociImage.ImageLayout
 	err = reg.WalkTGZ(f, func(header *tar.Header, rdr io.Reader) (bool, error) {
 		if !header.FileInfo().Mode().IsRegular() {
 			return true, nil
@@ -212,17 +204,37 @@ func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 		if strings.HasPrefix(header.Name, "blobs/") {
 			blob := strings.Replace(header.Name[6:], "/", ":", 1)
 			entry.Blobs[blob] = struct{}{}
+		} else if header.Name == "index.json" {
+			var index ociImage.Index
+			if err := json.NewDecoder(rdr).Decode(&index); err != nil {
+				return false, fmt.Errorf("Index decoding failed: %v", err)
+			}
+
+			for _, manifest := range index.Manifests {
+				if manifest.MediaType != ociImage.MediaTypeImageManifest {
+					continue
+				}
+				if manifest.Annotations == nil {
+					continue
+				}
+				refname := manifest.Annotations["org.opencontainers.image.ref.name"]
+				if refname == "" {
+					continue
+				}
+				entry.Refs[refname] = manifest.Digest.String()
+			}
+
 		} else if strings.HasPrefix(header.Name, "refs/") {
 			refname := header.Name[5:]
-			var refblob OCIBlobRef
+			var refblob ociImage.Descriptor
 			if err := json.NewDecoder(rdr).Decode(&refblob); err != nil {
-				return false, err
+				return false, fmt.Errorf("Ref descriptor decoding failed: %v", err)
 			}
 			if refblob.MediaType != "application/vnd.oci.image.manifest.v1+json" {
 				// Ignore unknown manifest type
 				return true, nil
 			}
-			entry.Refs[refname] = refblob.Digest
+			entry.Refs[refname] = refblob.Digest.String()
 		} else if header.Name == "oci-layout" {
 			return true, json.NewDecoder(rdr).Decode(&layout)
 		}
@@ -231,8 +243,11 @@ func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	if layout.ImageLayoutVersion != "1.0.0" {
-		return nil, fmt.Errorf("Unknown OCI version '%s'", layout.ImageLayoutVersion)
+	if layout == nil {
+		return nil, fmt.Errorf("No ImageLayout found!")
+	}
+	if layout.Version != "1.0.0" {
+		return nil, fmt.Errorf("Unknown OCI version '%s'", layout.Version)
 	}
 	return &entry, nil
 }
