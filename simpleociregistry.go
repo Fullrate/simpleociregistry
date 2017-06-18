@@ -8,6 +8,7 @@ import (
 	flag "github.com/ogier/pflag"
 	log "github.com/sirupsen/logrus"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,10 +20,16 @@ import (
 	ociImage "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+type OCIBlobEntry struct {
+	Size   int64
+	Source string
+	File   *os.File
+}
+
 type OCISummary struct {
 	Path    string
 	ModTime time.Time
-	Blobs   map[string]struct{}
+	Blobs   map[string]*OCIBlobEntry
 	Refs    map[string]string
 }
 
@@ -35,7 +42,7 @@ type OCIReferenceEntry struct {
 type OCIRegistry struct {
 	basedir string
 	refs    map[string]*OCIReferenceEntry // name:ref -> ref entry
-	blobs   map[string]string             // blobs -> file
+	blobs   map[string]*OCIBlobEntry      // blobs -> file
 	mut     sync.Mutex
 }
 
@@ -43,7 +50,7 @@ func NewOCIRegistry(basedir string) *OCIRegistry {
 	reg := &OCIRegistry{
 		basedir: basedir,
 		refs:    make(map[string]*OCIReferenceEntry),
-		blobs:   make(map[string]string),
+		blobs:   make(map[string]*OCIBlobEntry),
 	}
 	go reg.cleanup()
 	return reg
@@ -60,8 +67,8 @@ func (reg *OCIRegistry) cleanup() {
 			// Collect list of files that have to be checked for accessiblity
 			files := make(map[string]struct{})
 
-			for _, f := range reg.blobs {
-				files[f] = struct{}{}
+			for _, b := range reg.blobs {
+				files[b.Source] = struct{}{}
 			}
 			for _, e := range reg.refs {
 				files[e.Path] = struct{}{}
@@ -78,10 +85,12 @@ func (reg *OCIRegistry) cleanup() {
 			// Files now contains a list of deleted/inaccessible files. We can use this
 			// to filter blobs and refs.
 
-			blobs := make(map[string]string)
+			blobs := make(map[string]*OCIBlobEntry)
 			for b, f := range reg.blobs {
-				if _, ok := files[f]; !ok {
+				if _, ok := files[f.Source]; !ok {
 					blobs[b] = f
+				} else {
+					f.File.Close()
 				}
 			}
 
@@ -189,7 +198,7 @@ func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 
 	entry := OCISummary{
 		Path:    path,
-		Blobs:   make(map[string]struct{}),
+		Blobs:   make(map[string]*OCIBlobEntry),
 		Refs:    make(map[string]string),
 		ModTime: fi.ModTime(),
 	}
@@ -201,7 +210,28 @@ func (reg *OCIRegistry) SummarizeOCIFile(path string) (*OCISummary, error) {
 		}
 		if strings.HasPrefix(header.Name, "blobs/") {
 			blob := strings.Replace(header.Name[6:], "/", ":", 1)
-			entry.Blobs[blob] = struct{}{}
+			f, err := ioutil.TempFile("", "reg_blob_")
+			if err != nil {
+				return false, fmt.Errorf("Could not create temp file for blob %s: %v", blob, err)
+			}
+			if err := os.Remove(f.Name()); err != nil {
+				f.Close()
+				return false, fmt.Errorf("Could not unlink temp file for blob %s: %v", blob, err)
+			}
+			n, err := io.Copy(f, rdr)
+			if err != nil {
+				f.Close()
+				return false, fmt.Errorf("Could not cache blob %s: %v", blob, err)
+			}
+			if n != header.Size {
+				f.Close()
+				return false, fmt.Errorf("Blob %s too short")
+			}
+			entry.Blobs[blob] = &OCIBlobEntry{
+				Size:   header.Size,
+				Source: path,
+				File:   f,
+			}
 		} else if header.Name == "index.json" {
 			var index ociImage.Index
 			if err := json.NewDecoder(rdr).Decode(&index); err != nil {
@@ -332,9 +362,11 @@ func (reg *OCIRegistry) GetManifestBlob(name, reference string) string {
 	reg.mut.Lock()
 	defer reg.mut.Unlock()
 
-	for b, _ := range choice.Blobs {
+	for b, f := range choice.Blobs {
 		if _, ok := reg.blobs[b]; !ok {
-			reg.blobs[b] = choice.Path
+			reg.blobs[b] = f
+		} else {
+			f.File.Close() // Blob already exists, so we can close the new file
 		}
 	}
 
@@ -357,47 +389,24 @@ func (reg *OCIRegistry) GetManifestBlob(name, reference string) string {
 	return curref.Blob
 }
 
-func (reg *OCIRegistry) GetBlob(blob string, cb func(header *tar.Header, rdr io.Reader) error) (bool, error) {
+func (reg *OCIRegistry) GetBlob(blob string, cb func(size int64, rdr io.Reader) error) (bool, error) {
 	reg.mut.Lock()
 	// No defer, need explicit control so we don't have to hold the lock during the
 	// file scan.
 
-	fn, ok := reg.blobs[blob]
+	b, ok := reg.blobs[blob]
 	if !ok {
 		reg.mut.Unlock()
 		return false, fmt.Errorf("Blob reference not found")
 	}
 
-	f, err := os.Open(fn)
-	if err != nil {
-		// Blob was not available anymore, so remove it from our cache.
-		// When the manifest is later re-pulled, we will get back the blob.
-		delete(reg.blobs, blob)
-		reg.mut.Unlock()
-		return false, err
-	}
-	defer f.Close()
+	size := b.Size
+	rdr := io.NewSectionReader(b.File, 0, size)
 
 	// Now that we have the file handle, we can drop the lock safely
 	reg.mut.Unlock()
 
-	found := false
-	err = reg.WalkTGZ(f, func(header *tar.Header, rdr io.Reader) (bool, error) {
-		if !header.FileInfo().Mode().IsRegular() {
-			return true, nil
-		}
-		if !strings.HasPrefix(header.Name, "blobs/") {
-			return true, nil
-		}
-		cur := strings.Replace(header.Name[6:], "/", ":", 1)
-		if cur == blob {
-			found = true
-			return false, cb(header, rdr)
-		} else {
-			return true, nil
-		}
-	})
-	return found, err
+	return true, cb(size, rdr)
 }
 
 func (reg *OCIRegistry) HandleManifests(name, reference string, w http.ResponseWriter, r *http.Request) {
@@ -406,7 +415,7 @@ func (reg *OCIRegistry) HandleManifests(name, reference string, w http.ResponseW
 		w.WriteHeader(404)
 		return
 	}
-	found, _ := reg.GetBlob(blob, func(header *tar.Header, rdr io.Reader) error {
+	found, _ := reg.GetBlob(blob, func(size int64, rdr io.Reader) error {
 		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 		w.WriteHeader(200)
 		_, err := io.Copy(w, rdr)
@@ -418,8 +427,8 @@ func (reg *OCIRegistry) HandleManifests(name, reference string, w http.ResponseW
 }
 
 func (reg *OCIRegistry) HandleBlobs(name, blob string, w http.ResponseWriter, r *http.Request) {
-	found, _ := reg.GetBlob(blob, func(header *tar.Header, rdr io.Reader) error {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", header.Size))
+	found, _ := reg.GetBlob(blob, func(size int64, rdr io.Reader) error {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 		w.WriteHeader(200)
 		_, err := io.Copy(w, rdr)
 		return err
