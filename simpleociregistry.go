@@ -124,9 +124,7 @@ func (reg *OCIRegistry) FindCandidates(name, reference string) ([]ImageCandidate
 	}
 	patterns := []string{
 		filepath.Join(path, reference+".oci"),
-		filepath.Join(path, "*.oci"),
 		path + ":" + reference + ".oci",
-		path + ":*.oci",
 		path + ".oci",
 	}
 	var candidates []string

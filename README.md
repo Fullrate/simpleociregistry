@@ -22,9 +22,7 @@ Image names and references are mapped to .oci files. The candidates for a given
 <name>:<reference> are, in order, relative to the image dir:
 
   - `<name>/<reference>.oci`
-  - `<name>/*.oci`
   - `<name>:<reference>.oci`
-  - `<name>:*.oci`
   - `<name>.oci`
 
 The available images are found by expanding the above globs, and then searching
