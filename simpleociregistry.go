@@ -126,8 +126,8 @@ func (s ImageCandidateSlice) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-func (reg *OCIRegistry) FindCandidates(name, reference string) ([]ImageCandidate, error) {
-	path, err := filepath.Abs(filepath.Join(reg.basedir, name))
+func FindCandidates(basedir, name, reference string) ([]ImageCandidate, error) {
+	path, err := filepath.Abs(filepath.Join(basedir, name))
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +286,7 @@ func (reg *OCIRegistry) GetManifestBlob(name, reference string) string {
 	// Get the current reference. Might now exist
 	curref := reg.refs[name+":"+reference]
 
-	cands, err := reg.FindCandidates(name, reference)
+	cands, err := FindCandidates(reg.basedir, name, reference)
 	if err != nil {
 		reg.mut.Unlock()
 		log.WithFields(log.Fields{
@@ -441,7 +441,7 @@ func (reg *OCIRegistry) HandleBlobs(name, blob string, w http.ResponseWriter, r 
 func (reg *OCIRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 
-	path := strings.TrimSpace(strings.TrimPrefix(r.URL.String(), "/v2/"))
+	path := r.URL.String()
 
 	if path == "" {
 		w.WriteHeader(200)
@@ -507,7 +507,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/v2/", NewOCIRegistry(*basedir))
+	mux.Handle("/v2/", http.StripPrefix("/v2/", NewOCIRegistry(*basedir)))
 
 	log.Fatal(http.ListenAndServeTLS(*listen, *certfile, *keyfile, mux))
 }
