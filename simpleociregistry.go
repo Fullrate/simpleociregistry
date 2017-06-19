@@ -39,6 +39,7 @@ type OCIReferenceEntry struct {
 	ModTime         time.Time
 }
 
+// A simple implementation of the Docker V2 API for serving static OCI files
 type OCIRegistry struct {
 	basedir string
 	refs    map[string]*OCIReferenceEntry // name:ref -> ref entry
@@ -486,6 +487,32 @@ func (reg *OCIRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// A HTTP server for serving static .oci files directly over HTTP.
+type OCIDir struct {
+	Basedir string
+}
+
+func (reg OCIDir) Open(name string) (http.File, error) {
+	f, err := http.Dir(reg.Basedir).Open(name)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if fi.IsDir() {
+		f.Close()
+		return nil, os.ErrPermission
+	}
+	if !strings.HasSuffix(fi.Name(), ".oci") {
+		f.Close()
+		return nil, os.ErrPermission
+	}
+	return f, nil
+}
+
 func main() {
 
 	loglevel := flag.String("loglevel", "info", "Debug level")
@@ -508,6 +535,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v2/", http.StripPrefix("/v2/", NewOCIRegistry(*basedir)))
+	mux.Handle("/img/", http.StripPrefix("/img/", http.FileServer(OCIDir{*basedir})))
 
 	log.Fatal(http.ListenAndServeTLS(*listen, *certfile, *keyfile, mux))
 }
